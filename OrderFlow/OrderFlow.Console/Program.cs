@@ -1,83 +1,98 @@
 ﻿using OrderFlow.Console.Data;
+using OrderFlow.Console.Events;
 using OrderFlow.Console.Models;
 using OrderFlow.Console.Services;
+using System.Diagnostics;
 
 var orders = SampleData.Orders;
 var customers = SampleData.Customers;
 
-Console.WriteLine("========== TASK 1: Domain Model ==========");
-foreach (var order in orders)
-    Console.WriteLine($"Order #{order.Id} | {order.Customer.Name} | {order.Status} | {order.TotalAmount:C}");
+System.Console.WriteLine("========== TASK 1: Events ==========");
 
-Console.WriteLine("\n========== TASK 2: Validation ==========");
-var validator = new OrderValidator();
+var pipeline = new OrderPipeline();
 
-var validOrder = orders[0];
-var (isValid, errors) = validator.ValidateAll(validOrder);
-Console.WriteLine($"\nOrder #{validOrder.Id} — {(isValid ? "VALID" : "INVALID")}");
-if (!isValid) errors.ForEach(e => Console.WriteLine($"  [ERROR] {e}"));
+pipeline.StatusChanged += (_, e) =>
+    System.Console.WriteLine($"  [LOG]   Order #{e.Order.Id}: {e.OldStatus} → {e.NewStatus} at {e.Timestamp:HH:mm:ss}");
 
-var invalidOrder = new Order
+pipeline.StatusChanged += (_, e) =>
+{
+    if (e.NewStatus == OrderStatus.Completed)
+        System.Console.WriteLine($"  [EMAIL] Sending confirmation to {e.Order.Customer.Email}");
+};
+
+int completedCount = 0;
+pipeline.StatusChanged += (_, e) =>
+{
+    if (e.NewStatus == OrderStatus.Completed)
+        completedCount++;
+};
+
+pipeline.ValidationCompleted += (_, e) =>
+{
+    if (e.IsValid)
+        System.Console.WriteLine($"  [VALID] Order #{e.Order.Id} passed validation");
+    else
+    {
+        System.Console.WriteLine($"  [VALID] Order #{e.Order.Id} FAILED validation:");
+        e.Errors.ForEach(err => System.Console.WriteLine($"    - {err}"));
+    }
+};
+
+pipeline.ProcessOrder(orders[0]);
+pipeline.ProcessOrder(orders[2]);
+
+var badOrder = new Order
 {
     Id = 99,
     Customer = customers[0],
-    Status = OrderStatus.Cancelled,
+    Status = OrderStatus.New,
     CreatedAt = DateTime.Now.AddDays(5),
     Items = new List<OrderItem>()
 };
-var (isValid2, errors2) = validator.ValidateAll(invalidOrder);
-Console.WriteLine($"\nOrder #{invalidOrder.Id} — {(isValid2 ? "VALID" : "INVALID")}");
-if (!isValid2) errors2.ForEach(e => Console.WriteLine($"  [ERROR] {e}"));
+pipeline.ProcessOrder(badOrder);
 
-Console.WriteLine("\n========== TASK 3: Action, Func, Predicate ==========");
-var processor = new OrderProcessor(orders);
+System.Console.WriteLine($"\n  Total completed: {completedCount}");
 
-Console.WriteLine("\n-- High value orders (> 1000) --");
-processor.Filter(o => o.TotalAmount > 1000)
-         .ForEach(o => Console.WriteLine($"  #{o.Id} {o.Customer.Name} {o.TotalAmount:C}"));
+System.Console.WriteLine("\n========== TASK 2: Async ==========");
 
-Console.WriteLine("\n-- VIP customer orders --");
-processor.Filter(o => o.Customer.IsVip)
-         .ForEach(o => Console.WriteLine($"  #{o.Id} {o.Customer.Name} {o.TotalAmount:C}"));
+var simulator = new ExternalServiceSimulator();
 
-Console.WriteLine("\n-- Completed orders --");
-processor.Filter(o => o.Status == OrderStatus.Completed)
-         .ForEach(o => Console.WriteLine($"  #{o.Id} {o.Customer.Name} {o.TotalAmount:C}"));
+System.Console.WriteLine("\n-- Sequential processing --");
+var swSeq = Stopwatch.StartNew();
+foreach (var order in orders.Take(3))
+    await simulator.ProcessOrderAsync(order);
+swSeq.Stop();
+System.Console.WriteLine($"\nSequential total: {swSeq.ElapsedMilliseconds}ms");
 
-Console.WriteLine("\n-- Action: print all orders --");
-processor.ForEach(o => Console.WriteLine($"  #{o.Id} | {o.Status} | {o.TotalAmount:C}"));
+System.Console.WriteLine("\n-- Parallel processing (max 3 concurrent) --");
+var swPar = Stopwatch.StartNew();
+await simulator.ProcessMultipleOrdersAsync(orders);
+swPar.Stop();
+System.Console.WriteLine($"\nParallel total: {swPar.ElapsedMilliseconds}ms");
 
-Console.WriteLine("\n-- Action: mark New orders as Validated --");
-processor.ForEach(o =>
+System.Console.WriteLine($"\nSpeedup: {swSeq.ElapsedMilliseconds}ms → {swPar.ElapsedMilliseconds}ms");
+
+System.Console.WriteLine("\n========== TASK 3: Thread Safety ==========");
+
+var stats = new OrderStatistics();
+
+System.Console.WriteLine("\n-- Unsafe (no synchronization) --");
+for (int run = 1; run <= 3; run++)
 {
-    if (o.Status == OrderStatus.New)
-    {
-        o.Status = OrderStatus.Validated;
-        Console.WriteLine($"  Order #{o.Id} status changed to Validated");
-    }
-});
+    stats.Reset();
+    Parallel.ForEach(orders, order => stats.UpdateUnsafe(order));
+    System.Console.WriteLine($"  Run {run}: Processed={stats.TotalProcessedUnsafe}, Revenue={stats.TotalRevenueUnsafe:C}");
+}
 
-Console.WriteLine("\n-- Func projection to anonymous type --");
-var projected = processor.Project(o => new
+System.Console.WriteLine("\n-- Safe (with synchronization) --");
+for (int run = 1; run <= 3; run++)
 {
-    Id = o.Id,
-    Customer = o.Customer.Name,
-    Total = o.TotalAmount,
-    ItemCount = o.Items.Count
-});
-projected.ForEach(p => Console.WriteLine($"  #{p.Id} {p.Customer} | {p.ItemCount} items | {p.Total:C}"));
+    stats.Reset();
+    Parallel.ForEach(orders, order => stats.UpdateSafe(order));
+    System.Console.WriteLine($"  Run {run}: Processed={stats.TotalProcessed}, Revenue={stats.TotalRevenue:C}");
+}
 
-Console.WriteLine("\n-- Aggregations --");
-Console.WriteLine($"  Sum:     {processor.Aggregate(os => os.Sum(o => o.TotalAmount)):C}");
-Console.WriteLine($"  Average: {processor.Aggregate(os => os.Average(o => o.TotalAmount)):C}");
-Console.WriteLine($"  Max:     {processor.Aggregate(os => os.Max(o => o.TotalAmount)):C}");
-
-Console.WriteLine("\n-- Chain: top 3 high-value non-cancelled orders --");
-processor.ProcessTopN(
-    filter:  o => o.Status != OrderStatus.Cancelled,
-    sortKey: o => o.TotalAmount,
-    topN:    3,
-    print:   o => Console.WriteLine($"  #{o.Id} {o.Customer.Name} | {o.Status} | {o.TotalAmount:C}")
-);
-
-LinqQueries.RunAll(orders, customers);
+System.Console.WriteLine("\n-- Safe detailed stats --");
+stats.Reset();
+Parallel.ForEach(orders, order => stats.UpdateSafe(order));
+stats.PrintSafe();
