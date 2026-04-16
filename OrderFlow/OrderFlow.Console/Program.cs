@@ -1,98 +1,117 @@
 ﻿using OrderFlow.Console.Data;
 using OrderFlow.Console.Events;
 using OrderFlow.Console.Models;
+using OrderFlow.Console.Persistence;
 using OrderFlow.Console.Services;
+using OrderFlow.Console.Watchers;
 using System.Diagnostics;
 
 var orders = SampleData.Orders;
 var customers = SampleData.Customers;
 
-System.Console.WriteLine("========== TASK 1: Events ==========");
+System.Console.WriteLine("========== LAB 1: Domain Model ==========");
+foreach (var o in orders)
+    System.Console.WriteLine($"  Order #{o.Id} | {o.Customer.Name} | {o.Status} | {o.TotalAmount:C}");
 
+System.Console.WriteLine("\n========== LAB 2: Events ==========");
 var pipeline = new OrderPipeline();
-
 pipeline.StatusChanged += (_, e) =>
-    System.Console.WriteLine($"  [LOG]   Order #{e.Order.Id}: {e.OldStatus} → {e.NewStatus} at {e.Timestamp:HH:mm:ss}");
-
+    System.Console.WriteLine($"  [LOG] Order #{e.Order.Id}: {e.OldStatus} → {e.NewStatus}");
 pipeline.StatusChanged += (_, e) =>
 {
     if (e.NewStatus == OrderStatus.Completed)
-        System.Console.WriteLine($"  [EMAIL] Sending confirmation to {e.Order.Customer.Email}");
+        System.Console.WriteLine($"  [EMAIL] Confirmation → {e.Order.Customer.Email}");
 };
-
-int completedCount = 0;
-pipeline.StatusChanged += (_, e) =>
-{
-    if (e.NewStatus == OrderStatus.Completed)
-        completedCount++;
-};
-
 pipeline.ValidationCompleted += (_, e) =>
-{
-    if (e.IsValid)
-        System.Console.WriteLine($"  [VALID] Order #{e.Order.Id} passed validation");
-    else
-    {
-        System.Console.WriteLine($"  [VALID] Order #{e.Order.Id} FAILED validation:");
-        e.Errors.ForEach(err => System.Console.WriteLine($"    - {err}"));
-    }
-};
+    System.Console.WriteLine($"  [VALID] Order #{e.Order.Id}: {(e.IsValid ? "OK" : "FAILED")}");
 
 pipeline.ProcessOrder(orders[0]);
-pipeline.ProcessOrder(orders[2]);
 
-var badOrder = new Order
+System.Console.WriteLine("\n========== LAB 3 TASK 1: Repository ==========");
+
+var repo = new OrderRepository();
+const string jsonPath = "data/orders.json";
+const string xmlPath  = "data/orders.xml";
+
+await repo.SaveToJsonAsync(orders, jsonPath);
+System.Console.WriteLine($"  Saved {orders.Count} orders → {jsonPath}");
+
+await repo.SaveToXmlAsync(orders, xmlPath);
+System.Console.WriteLine($"  Saved {orders.Count} orders → {xmlPath}");
+
+var loadedJson = await repo.LoadFromJsonAsync(jsonPath);
+System.Console.WriteLine($"\n  JSON round-trip: {loadedJson.Count} orders loaded");
+System.Console.WriteLine($"  Original total:  {orders.Sum(o => o.TotalAmount):C}");
+System.Console.WriteLine($"  Loaded total:    {loadedJson.Sum(o => o.TotalAmount):C}");
+System.Console.WriteLine($"  Match: {orders.Sum(o => o.TotalAmount) == loadedJson.Sum(o => o.TotalAmount)}");
+
+var loadedXml = await repo.LoadFromXmlAsync(xmlPath);
+System.Console.WriteLine($"\n  XML round-trip: {loadedXml.Count} orders loaded");
+System.Console.WriteLine($"  Original total: {orders.Sum(o => o.TotalAmount):C}");
+System.Console.WriteLine($"  Loaded total:   {loadedXml.Sum(o => o.TotalAmount):C}");
+System.Console.WriteLine($"  Match: {orders.Sum(o => o.TotalAmount) == loadedXml.Sum(o => o.TotalAmount)}");
+
+var missing = await repo.LoadFromJsonAsync("data/nonexistent.json");
+System.Console.WriteLine($"\n  Missing file → returned {missing.Count} orders (expected 0)");
+
+System.Console.WriteLine("\n========== LAB 3 TASK 2: XML Report ==========");
+
+var builder = new XmlReportBuilder();
+const string reportPath = "data/report.xml";
+
+var report = builder.BuildReport(orders);
+await builder.SaveReportAsync(report, reportPath);
+System.Console.WriteLine($"  Report saved → {reportPath}");
+System.Console.WriteLine($"  Preview:\n{report}");
+
+var highValueIds = await builder.FindHighValueOrderIdsAsync(reportPath, 1000m);
+System.Console.WriteLine($"\n  Orders with total > 1000:");
+foreach (var id in highValueIds)
+    System.Console.WriteLine($"    Order #{id}");
+
+System.Console.WriteLine("\n========== LAB 3 TASK 3: InboxWatcher ==========");
+
+const string inboxPath = "inbox";
+var watcherPipeline = new OrderPipeline();
+
+watcherPipeline.StatusChanged += (_, e) =>
+    System.Console.WriteLine($"  [PIPELINE] Order #{e.Order.Id}: {e.OldStatus} → {e.NewStatus}");
+watcherPipeline.ValidationCompleted += (_, e) =>
+    System.Console.WriteLine($"  [PIPELINE] Validation #{e.Order.Id}: {(e.IsValid ? "OK" : "FAILED")}");
+
+using var watcher = new InboxWatcher(inboxPath, watcherPipeline);
+
+System.Console.WriteLine("  [DEMO] Dropping test files into inbox/ every 4 seconds...\n");
+
+for (int wave = 1; wave <= 2; wave++)
 {
-    Id = 99,
-    Customer = customers[0],
-    Status = OrderStatus.New,
-    CreatedAt = DateTime.Now.AddDays(5),
-    Items = new List<OrderItem>()
-};
-pipeline.ProcessOrder(badOrder);
+    var testOrders = new List<Order>
+    {
+        new Order
+        {
+            Id = 100 + wave,
+            Customer = customers[wave % customers.Count],
+            Status = OrderStatus.New,
+            CreatedAt = DateTime.Now,
+            Items = new List<OrderItem>
+            {
+                new OrderItem
+                {
+                    Id = wave,
+                    Product = SampleData.Products[wave % SampleData.Products.Count],
+                    Quantity = 1,
+                    UnitPrice = SampleData.Products[wave % SampleData.Products.Count].Price
+                }
+            }
+        }
+    };
 
-System.Console.WriteLine($"\n  Total completed: {completedCount}");
+    var inboxFile = Path.Combine(inboxPath, $"import_wave{wave}_{DateTime.Now:HHmmss}.json");
+    await repo.SaveToJsonAsync(testOrders, inboxFile);
+    System.Console.WriteLine($"  [DEMO] Dropped: {Path.GetFileName(inboxFile)}");
 
-System.Console.WriteLine("\n========== TASK 2: Async ==========");
-
-var simulator = new ExternalServiceSimulator();
-
-System.Console.WriteLine("\n-- Sequential processing --");
-var swSeq = Stopwatch.StartNew();
-foreach (var order in orders.Take(3))
-    await simulator.ProcessOrderAsync(order);
-swSeq.Stop();
-System.Console.WriteLine($"\nSequential total: {swSeq.ElapsedMilliseconds}ms");
-
-System.Console.WriteLine("\n-- Parallel processing (max 3 concurrent) --");
-var swPar = Stopwatch.StartNew();
-await simulator.ProcessMultipleOrdersAsync(orders);
-swPar.Stop();
-System.Console.WriteLine($"\nParallel total: {swPar.ElapsedMilliseconds}ms");
-
-System.Console.WriteLine($"\nSpeedup: {swSeq.ElapsedMilliseconds}ms → {swPar.ElapsedMilliseconds}ms");
-
-System.Console.WriteLine("\n========== TASK 3: Thread Safety ==========");
-
-var stats = new OrderStatistics();
-
-System.Console.WriteLine("\n-- Unsafe (no synchronization) --");
-for (int run = 1; run <= 3; run++)
-{
-    stats.Reset();
-    Parallel.ForEach(orders, order => stats.UpdateUnsafe(order));
-    System.Console.WriteLine($"  Run {run}: Processed={stats.TotalProcessedUnsafe}, Revenue={stats.TotalRevenueUnsafe:C}");
+    await Task.Delay(4000);
 }
 
-System.Console.WriteLine("\n-- Safe (with synchronization) --");
-for (int run = 1; run <= 3; run++)
-{
-    stats.Reset();
-    Parallel.ForEach(orders, order => stats.UpdateSafe(order));
-    System.Console.WriteLine($"  Run {run}: Processed={stats.TotalProcessed}, Revenue={stats.TotalRevenue:C}");
-}
-
-System.Console.WriteLine("\n-- Safe detailed stats --");
-stats.Reset();
-Parallel.ForEach(orders, order => stats.UpdateSafe(order));
-stats.PrintSafe();
+System.Console.WriteLine("\n  [DEMO] Done. Press Enter to exit.");
+System.Console.ReadLine();
