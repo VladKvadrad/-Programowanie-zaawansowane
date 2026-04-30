@@ -1,117 +1,91 @@
-﻿using OrderFlow.Console.Data;
-using OrderFlow.Console.Events;
+﻿using Microsoft.EntityFrameworkCore;
 using OrderFlow.Console.Models;
 using OrderFlow.Console.Persistence;
 using OrderFlow.Console.Services;
-using OrderFlow.Console.Watchers;
-using System.Diagnostics;
 
-var orders = SampleData.Orders;
-var customers = SampleData.Customers;
+await using var db = new OrderFlowContext();
+await db.Database.MigrateAsync();
+System.Console.WriteLine("  [DB] Migrations applied.");
 
-System.Console.WriteLine("========== LAB 1: Domain Model ==========");
-foreach (var o in orders)
-    System.Console.WriteLine($"  Order #{o.Id} | {o.Customer.Name} | {o.Status} | {o.TotalAmount:C}");
+var seeder = new DatabaseSeeder();
+await seeder.SeedAsync(db);
 
-System.Console.WriteLine("\n========== LAB 2: Events ==========");
-var pipeline = new OrderPipeline();
-pipeline.StatusChanged += (_, e) =>
-    System.Console.WriteLine($"  [LOG] Order #{e.Order.Id}: {e.OldStatus} → {e.NewStatus}");
-pipeline.StatusChanged += (_, e) =>
+var svc = new OrderDbService();
+
+System.Console.WriteLine("\n========== LAB 4 TASK 1: DbContext ==========");
+var pendingMigrations = await db.Database.GetPendingMigrationsAsync();
+var appliedMigrations = await db.Database.GetAppliedMigrationsAsync();
+System.Console.WriteLine("  Applied migrations:");
+foreach (var m in appliedMigrations)
+    System.Console.WriteLine($"    ✓ {m}");
+if (!pendingMigrations.Any())
+    System.Console.WriteLine("  No pending migrations.");
+
+System.Console.WriteLine("\n========== LAB 4 TASK 2: CRUD ==========");
+
+await using var db2 = new OrderFlowContext();
+
+System.Console.WriteLine("\n-- Create --");
+var firstCustomer = await db2.Customers.FirstAsync();
+await svc.CreateOrderAsync(db2, firstCustomer.Id);
+
+System.Console.WriteLine("\n-- Read --");
+await svc.ReadOrdersAsync(db2);
+
+System.Console.WriteLine("\n-- Update --");
+var newOrder = await db2.Orders.FirstOrDefaultAsync(o => o.Status == OrderStatus.New);
+if (newOrder != null)
+    await svc.UpdateOrderAsync(db2, newOrder.Id);
+
+System.Console.WriteLine("\n-- Delete (Cancelled order) --");
+await svc.DeleteCancelledOrderAsync(db2);
+
+System.Console.WriteLine("\n-- Delete (Customer with orders → Restrict) --");
+await svc.TryDeleteCustomerWithOrdersAsync(db2);
+
+System.Console.WriteLine("\n========== LAB 4 TASK 3: Queries ==========");
+
+await using var db3 = new OrderFlowContext();
+
+System.Console.WriteLine();
+await svc.Query1VipOrdersAboveThresholdAsync(db3, 500m);
+
+System.Console.WriteLine();
+await svc.Query2CustomerRankingAsync(db3);
+
+System.Console.WriteLine();
+await svc.Query3AvgByCity(db3);
+
+System.Console.WriteLine();
+await svc.Query4NeverOrderedProductsAsync(db3);
+
+System.Console.WriteLine();
+await svc.Query5DynamicFilterAsync(db3, OrderStatus.Completed, 500m);
+
+System.Console.WriteLine("\n========== LAB 4 TASK 3: Transactions ==========");
+await using var db4 = new OrderFlowContext();
+
+var orderForSuccess = await db4.Orders
+    .Include(o => o.Items).ThenInclude(i => i.Product)
+    .FirstOrDefaultAsync(o => o.Status == OrderStatus.New);
+
+if (orderForSuccess != null)
 {
-    if (e.NewStatus == OrderStatus.Completed)
-        System.Console.WriteLine($"  [EMAIL] Confirmation → {e.Order.Customer.Email}");
-};
-pipeline.ValidationCompleted += (_, e) =>
-    System.Console.WriteLine($"  [VALID] Order #{e.Order.Id}: {(e.IsValid ? "OK" : "FAILED")}");
-
-pipeline.ProcessOrder(orders[0]);
-
-System.Console.WriteLine("\n========== LAB 3 TASK 1: Repository ==========");
-
-var repo = new OrderRepository();
-const string jsonPath = "data/orders.json";
-const string xmlPath  = "data/orders.xml";
-
-await repo.SaveToJsonAsync(orders, jsonPath);
-System.Console.WriteLine($"  Saved {orders.Count} orders → {jsonPath}");
-
-await repo.SaveToXmlAsync(orders, xmlPath);
-System.Console.WriteLine($"  Saved {orders.Count} orders → {xmlPath}");
-
-var loadedJson = await repo.LoadFromJsonAsync(jsonPath);
-System.Console.WriteLine($"\n  JSON round-trip: {loadedJson.Count} orders loaded");
-System.Console.WriteLine($"  Original total:  {orders.Sum(o => o.TotalAmount):C}");
-System.Console.WriteLine($"  Loaded total:    {loadedJson.Sum(o => o.TotalAmount):C}");
-System.Console.WriteLine($"  Match: {orders.Sum(o => o.TotalAmount) == loadedJson.Sum(o => o.TotalAmount)}");
-
-var loadedXml = await repo.LoadFromXmlAsync(xmlPath);
-System.Console.WriteLine($"\n  XML round-trip: {loadedXml.Count} orders loaded");
-System.Console.WriteLine($"  Original total: {orders.Sum(o => o.TotalAmount):C}");
-System.Console.WriteLine($"  Loaded total:   {loadedXml.Sum(o => o.TotalAmount):C}");
-System.Console.WriteLine($"  Match: {orders.Sum(o => o.TotalAmount) == loadedXml.Sum(o => o.TotalAmount)}");
-
-var missing = await repo.LoadFromJsonAsync("data/nonexistent.json");
-System.Console.WriteLine($"\n  Missing file → returned {missing.Count} orders (expected 0)");
-
-System.Console.WriteLine("\n========== LAB 3 TASK 2: XML Report ==========");
-
-var builder = new XmlReportBuilder();
-const string reportPath = "data/report.xml";
-
-var report = builder.BuildReport(orders);
-await builder.SaveReportAsync(report, reportPath);
-System.Console.WriteLine($"  Report saved → {reportPath}");
-System.Console.WriteLine($"  Preview:\n{report}");
-
-var highValueIds = await builder.FindHighValueOrderIdsAsync(reportPath, 1000m);
-System.Console.WriteLine($"\n  Orders with total > 1000:");
-foreach (var id in highValueIds)
-    System.Console.WriteLine($"    Order #{id}");
-
-System.Console.WriteLine("\n========== LAB 3 TASK 3: InboxWatcher ==========");
-
-const string inboxPath = "inbox";
-var watcherPipeline = new OrderPipeline();
-
-watcherPipeline.StatusChanged += (_, e) =>
-    System.Console.WriteLine($"  [PIPELINE] Order #{e.Order.Id}: {e.OldStatus} → {e.NewStatus}");
-watcherPipeline.ValidationCompleted += (_, e) =>
-    System.Console.WriteLine($"  [PIPELINE] Validation #{e.Order.Id}: {(e.IsValid ? "OK" : "FAILED")}");
-
-using var watcher = new InboxWatcher(inboxPath, watcherPipeline);
-
-System.Console.WriteLine("  [DEMO] Dropping test files into inbox/ every 4 seconds...\n");
-
-for (int wave = 1; wave <= 2; wave++)
-{
-    var testOrders = new List<Order>
-    {
-        new Order
-        {
-            Id = 100 + wave,
-            Customer = customers[wave % customers.Count],
-            Status = OrderStatus.New,
-            CreatedAt = DateTime.Now,
-            Items = new List<OrderItem>
-            {
-                new OrderItem
-                {
-                    Id = wave,
-                    Product = SampleData.Products[wave % SampleData.Products.Count],
-                    Quantity = 1,
-                    UnitPrice = SampleData.Products[wave % SampleData.Products.Count].Price
-                }
-            }
-        }
-    };
-
-    var inboxFile = Path.Combine(inboxPath, $"import_wave{wave}_{DateTime.Now:HHmmss}.json");
-    await repo.SaveToJsonAsync(testOrders, inboxFile);
-    System.Console.WriteLine($"  [DEMO] Dropped: {Path.GetFileName(inboxFile)}");
-
-    await Task.Delay(4000);
+    System.Console.WriteLine($"\n-- Transaction success: Order #{orderForSuccess.Id} --");
+    await svc.ProcessOrderTransactionAsync(db4, orderForSuccess.Id);
 }
 
-System.Console.WriteLine("\n  [DEMO] Done. Press Enter to exit.");
-System.Console.ReadLine();
+await using var db5 = new OrderFlowContext();
+var productToBreak = await db5.Products.FirstAsync();
+productToBreak.Stock = 0;
+await db5.SaveChangesAsync();
+
+var orderForFail = await db5.Orders
+    .Include(o => o.Items).ThenInclude(i => i.Product)
+    .FirstOrDefaultAsync(o => o.Status == OrderStatus.New || o.Status == OrderStatus.Validated);
+
+if (orderForFail != null)
+{
+    System.Console.WriteLine($"\n-- Transaction rollback: Order #{orderForFail.Id} (stock=0) --");
+    await svc.ProcessOrderTransactionAsync(db5, orderForFail.Id);
+}

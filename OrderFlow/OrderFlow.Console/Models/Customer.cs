@@ -7,4 +7,7 @@ public class Customer
     public string City { get; set; } = string.Empty;
     public string Email { get; set; } = string.Empty;
     public bool IsVip { get; set; }
+    public string? Notes { get; set; }
+
+    public ICollection<Order> Orders { get; set; } = new List<Order>();
 }

@@ -1,4 +1,6 @@
-﻿namespace OrderFlow.Console.Models;
+﻿using System.ComponentModel.DataAnnotations.Schema;
+
+namespace OrderFlow.Console.Models;
 
 public class Product
 {
@@ -7,4 +9,7 @@ public class Product
     public string Category { get; set; } = string.Empty;
     public decimal Price { get; set; }
     public bool IsAvailable { get; set; }
+    public int Stock { get; set; } = 10;
+
+    public ICollection<OrderItem> OrderItems { get; set; } = new List<OrderItem>();
 }
